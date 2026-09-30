@@ -86,6 +86,19 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 
 发布成功后得到递增版本号（第 1 版、第 2 版……），事件、所选主张（精度、区间、出处、考异）、关系与求解日期全部**复制进版本快照**；此后修改草稿不影响任何旧版本。访客页只展示当前最新版本。
 
+### 从任一已发布版本预览并恢复草稿
+
+在编辑台右下「已发布版本」中，每版都有「预览并恢复为此版」按钮：
+
+1. **预览（不改数据）**：对话框列出该版的事件、每条事件的**被选时间主张**（精度 / 区间 / 出处 / 求解日期）与全部「先于」关系，并对照列出**当前草稿中将被替换**的内容（现有事件及其主张数、现有关系）与当前草稿修订号。预览只是只读核对，不落任何数据。
+2. **确认**：请求回传**预览时的草稿修订号**与**当时最新版本号**。服务器在单个事务内：
+   - 若该版本不存在 → 404；
+   - 若确认前草稿被他人增删改过（修订号不一致）或最新版本号已变化 → **409 恢复冲突且不改任何数据**，需重新预览；
+   - 否则**原子替换整个草稿**：清空现有事件 / 主张 / 关系，按快照重建事件与「先于」关系，每个事件**只恢复该版被选定的那一条主张**（未选主张从不进快照，无法恢复）；返回**旧快照 id → 新草稿 id 的映射**（`events / claims / relations`）以及重建后的草稿全貌（即编辑台继续校验发布所需的**待选主张**）。编辑台会自动预选每条恢复的主张。
+3. 恢复后可照常「校验能否发布」「发布新版本」，仍须遵守编辑口令、求解校验与 `baseVersionNo` 冲突约定（恢复不改变 `baseVersionNo`，也不会自动发布）。
+
+草稿区每一次增删改（事件 / 主张 / 关系，以及恢复本身）都会把**草稿修订号** +1；`GET /api/editor/state` 与恢复接口都会返回 `draftRevision`。**历史快照与访客年表在恢复过程中保持不变**。
+
 ### 两名编辑者并发修改（版本冲突）
 
 发布请求必须带 `baseVersionNo`（编辑台打开时自动记录当前最新版本号）。若两名编辑者都从第 N 版开始改，第一人发布产生第 N+1 版后，第二人仍以 `baseVersionNo=N` 提交时：
@@ -109,14 +122,16 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 ```
 src/
   server.js     Express 入口、口令中间件、静态界面
-  routes.js     公开只读 API 与编辑者草稿/发布 API
-  db.js         SQLite 连接与建表（草稿区 + 版本快照区）
+  routes.js     公开只读 API 与编辑者草稿/发布/恢复 API
+  db.js         SQLite 连接与建表（草稿区 + 版本快照区 + 草稿修订号）
   dates.js      年/月/日精度 → 覆盖区间（公历序数日）
   solver.js     Tarjan 环检测 + 拓扑下界传播求严格先后可行解
   publish.js    发布事务：再校验 + 版本冲突检查 + 写不可变快照
+  draft.js      草稿全貌组装、草稿修订号与草稿变更事务
+  restore.js    恢复事务：预览只读 + 乐观并发校验 + 按快照原子重建草稿
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突）
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、恢复）
 ```
 
 ## 主要 HTTP API
@@ -136,3 +151,9 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
 - `POST /api/editor/publish` — 发布；体含 `selection:[{eventId,claimId}]`、`baseVersionNo`、`editor`、`note`
   - 422：`{errors:[{type:missing|cycle|temporal, eventIds, relationIds, message, detail}]}`
   - 409：`{code:"VERSION_CONFLICT", baseVersionNo, currentVersionNo, currentVersion}`
+- 从历史版本恢复草稿：
+  - `POST /api/editor/restore/preview` — 体含 `versionNo`；只读返回该版事件/被选主张/关系、当前草稿将被替换的内容、`draftRevision` 与 `latestVersionNo`；版本不存在 → 404 `VERSION_NOT_FOUND`
+  - `POST /api/editor/restore/confirm` — 体含 `versionNo`、`draftRevision`、`expectedLatestVersionNo`（取预览返回值）；原子替换整个草稿，返回 `{restoredFromVersionNo, idMap:{events,claims,relations}, state}`（`state` 即新草稿全貌，含待选主张）
+    - 409：`{code:"RESTORE_CONFLICT", message, previewDraftRevision, currentDraftRevision, expectedLatestVersionNo, currentVersionNo}`
+    - 404：`{code:"VERSION_NOT_FOUND"}`
+- 所有草稿增删改接口（含恢复确认）都会推进 `GET /api/editor/state` 返回的 `draftRevision`；预览与发布不推进。

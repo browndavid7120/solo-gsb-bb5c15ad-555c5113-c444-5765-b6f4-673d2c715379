@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS idx_rel_earlier ON relations(earlier_id);
 CREATE INDEX IF NOT EXISTS idx_rel_later ON relations(later_id);
 
+-- 草稿修订号：草稿区任意增删改（含从历史版本恢复）都单调 +1。
+-- 单行单列表；用于「恢复草稿」的乐观并发校验。
+CREATE TABLE IF NOT EXISTS draft_meta (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  revision INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO draft_meta (id, revision) VALUES (1, 0);
+
 -- ============ 发布区（不可变版本快照） ============
 CREATE TABLE IF NOT EXISTS versions (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,

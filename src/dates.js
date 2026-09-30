@@ -116,6 +116,7 @@ module.exports = {
   claimInterval,
   ordinalFromIso,
   isoFromOrdinal,
+  ymdFromOrdinal,
   formatClaimDate,
   PRECISION_LABEL,
 };
