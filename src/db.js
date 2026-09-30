@@ -86,6 +86,14 @@ CREATE TABLE IF NOT EXISTS version_relations (
   sort_order   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_vr_version ON version_relations(version_id);
+
+-- ============ 草稿修订号（乐观并发控制） ============
+-- 草稿区的任何增删改（含整体恢复）都把 revision 加 1。
+CREATE TABLE IF NOT EXISTS draft_meta (
+  id        INTEGER PRIMARY KEY CHECK (id = 1),
+  revision  INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO draft_meta (id, revision) VALUES (1, 0);
 `;
 
 let db;

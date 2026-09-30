@@ -4,6 +4,8 @@ const express = require('express');
 const { getDb } = require('./db');
 const { parseClaimDate, claimInterval, formatClaimDate } = require('./dates');
 const { evaluateDraft, publishVersion, latestVersionNo, getVersionDetail, getVersionSummary } = require('./publish');
+const { draftRevision, bumpDraftRevision } = require('./draft');
+const { getRestorePreview, confirmRestore } = require('./restore');
 
 const router = express.Router();
 
@@ -130,6 +132,7 @@ router.get('/api/editor/state', (req, res) => {
   res.json({
     currentVersionNo: latestVersionNo(),
     currentVersion: getVersionSummary(latestVersionNo()) || null,
+    draftRevision: draftRevision(),
     events,
     relations,
   });
@@ -140,6 +143,7 @@ router.post('/api/editor/events', (req, res) => {
   const title = requireString(req.body, 'title', { max: 200 });
   const description = optionalString(req.body, 'description', 5000);
   const info = getDb().prepare('INSERT INTO events (title, description) VALUES (?, ?)').run(title.trim(), description);
+  bumpDraftRevision();
   res.status(201).json({ event: eventRowToApi(getEventOr404(info.lastInsertRowid)) });
 });
 
@@ -151,6 +155,7 @@ router.put('/api/editor/events/:id', (req, res) => {
   getDb()
     .prepare('UPDATE events SET title = ?, description = ?, updated_at = datetime(\'now\') WHERE id = ?')
     .run(title.trim(), description, id);
+  bumpDraftRevision();
   res.json({ event: eventRowToApi(getEventOr404(id)) });
 });
 
@@ -158,6 +163,7 @@ router.delete('/api/editor/events/:id', (req, res) => {
   const id = Number(req.params.id);
   getEventOr404(id);
   getDb().prepare('DELETE FROM events WHERE id = ?').run(id);
+  bumpDraftRevision();
   res.json({ deleted: id });
 });
 
@@ -173,6 +179,7 @@ router.post('/api/editor/events/:id/claims', (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(eventId, p.precision, p.year, p.month, p.day, p.dateLabel, p.intervalStart, p.intervalEnd, p.source, p.note);
+  bumpDraftRevision();
   res.status(201).json({ claim: claimRowToApi(getDb().prepare('SELECT * FROM claims WHERE id = ?').get(info.lastInsertRowid)) });
 });
 
@@ -187,6 +194,7 @@ router.put('/api/editor/claims/:claimId', (req, res) => {
          interval_start=?, interval_end=?, source=?, note=? WHERE id=?`
     )
     .run(p.precision, p.year, p.month, p.day, p.dateLabel, p.intervalStart, p.intervalEnd, p.source, p.note, claimId);
+  bumpDraftRevision();
   res.json({ claim: claimRowToApi(getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId)) });
 });
 
@@ -195,6 +203,7 @@ router.delete('/api/editor/claims/:claimId', (req, res) => {
   const existing = getDb().prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
   if (!existing) throw { status: 404, message: `主张 ${claimId} 不存在` };
   getDb().prepare('DELETE FROM claims WHERE id = ?').run(claimId);
+  bumpDraftRevision();
   res.json({ deleted: claimId });
 });
 
@@ -214,6 +223,7 @@ router.post('/api/editor/relations', (req, res) => {
     .prepare('INSERT INTO relations (earlier_id, later_id, source, note) VALUES (?, ?, ?, ?)')
     .run(earlierId, laterId, source, note);
   const row = getDb().prepare('SELECT * FROM relations WHERE id = ?').get(info.lastInsertRowid);
+  bumpDraftRevision();
   res.status(201).json({
     relation: { id: row.id, earlierId: row.earlier_id, laterId: row.later_id, source: row.source, note: row.note },
   });
@@ -224,6 +234,7 @@ router.delete('/api/editor/relations/:id', (req, res) => {
   const row = getDb().prepare('SELECT * FROM relations WHERE id = ?').get(id);
   if (!row) throw { status: 404, message: `关系 ${id} 不存在` };
   getDb().prepare('DELETE FROM relations WHERE id = ?').run(id);
+  bumpDraftRevision();
   res.json({ deleted: id });
 });
 
@@ -282,6 +293,30 @@ router.post('/api/editor/publish', (req, res) => {
   const note = optionalString(req.body, 'note', 1000);
   const result = publishVersion({ selectionList, baseVersionNo, editor, note });
   res.status(201).json({ ok: true, ...result });
+});
+
+// ---- 从已发布版本恢复草稿：预览（只读，不改数据） ----
+router.get('/api/editor/restore/:versionNo', (req, res) => {
+  const versionNo = Number(req.params.versionNo);
+  res.json({ ok: true, ...getRestorePreview(versionNo) });
+});
+
+// ---- 从已发布版本恢复草稿：确认（原子替换整个草稿） ----
+router.post('/api/editor/restore/:versionNo/confirm', (req, res) => {
+  const versionNo = Number(req.params.versionNo);
+  const draftRev = req.body.draftRevision === null || req.body.draftRevision === undefined
+    ? null
+    : Number(req.body.draftRevision);
+  if (draftRev === null || !Number.isInteger(draftRev)) {
+    throw badRequest('draftRevision 必须是预览时返回的非负整数');
+  }
+  const current = latestVersionNo();
+  const baseVersionNo = req.body.baseVersionNo === null || req.body.baseVersionNo === undefined
+    ? current
+    : Number(req.body.baseVersionNo);
+  if (!Number.isInteger(baseVersionNo)) throw badRequest('baseVersionNo 必须是整数');
+  const result = confirmRestore({ versionNo, draftRevision: draftRev, baseVersionNo });
+  res.json({ ok: true, ...result });
 });
 
 // 版本列表（编辑者视角，结构与公开一致）

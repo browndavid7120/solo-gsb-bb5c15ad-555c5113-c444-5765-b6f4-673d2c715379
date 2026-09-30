@@ -94,6 +94,17 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 - **不会**静默覆盖对方版本；
 - 第二人需点击「刷新到最新版本并重新确认选择」，重新核对每个事件的主张单选后再发布。
 
+### 从历史版本恢复草稿
+
+想推倒重来时，可以把**任一已发布版本**恢复为当前草稿（历史快照与访客年表都不会改变）：
+
+1. 在右下「已发布版本」中找到目标版本，点击「预览并恢复为草稿」。
+2. 预览弹窗列出该版的**事件、被选时间主张、「先于」关系**，以及当前草稿中**将被整体替换**的内容；预览期间**不改任何数据**。
+3. 点击「确认：用该版整体替换当前草稿」。确认请求会提交预览时看到的**草稿修订号**与**最新版本号**。
+4. 确认成功后，服务器在单个事务内**原子替换整个草稿**：按快照重建事件与关系，且**只恢复该版被选定的那一条主张**（草稿中其余矛盾主张不恢复），返回旧快照 id → 新草稿 id 的映射与「待选主张」；编辑台会自动按待选主张勾选单选并再跑一次「校验能否发布」，确认无误后照常发布即可。
+
+并发保护：预览之后、确认之前，若有他人改动过草稿（草稿修订号变化）或发布了新版本（最新版本号变化），服务器返回 **409 冲突且不改数据**，请重新预览后再确认；目标版本不存在则返回 404。草稿区的任何增删改（包括恢复本身）都会推进草稿修订号。恢复后再发布仍是**新增一个不可变版本**，口令、求解校验与 `baseVersionNo` 冲突约定与平时完全一致。
+
 ### 访客（http://localhost:3000/）
 
 只渲染最新已发布版本：按系统确定的日期排列的时间线、每条事件所选主张的精度与出处、全部「先于」关系及其出处。草稿、未发布主张、未发布关系均不出现在任何公开接口中。尚无发布版本时仅显示「尚未发布」。
@@ -109,14 +120,16 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 ```
 src/
   server.js     Express 入口、口令中间件、静态界面
-  routes.js     公开只读 API 与编辑者草稿/发布 API
-  db.js         SQLite 连接与建表（草稿区 + 版本快照区）
+  routes.js     公开只读 API 与编辑者草稿/发布/恢复 API
+  db.js         SQLite 连接与建表（草稿区 + 版本快照区 + 草稿修订号）
+  draft.js      草稿修订号与草稿现状读取
   dates.js      年/月/日精度 → 覆盖区间（公历序数日）
   solver.js     Tarjan 环检测 + 拓扑下界传播求严格先后可行解
   publish.js    发布事务：再校验 + 版本冲突检查 + 写不可变快照
+  restore.js    恢复事务：预览 + 修订号/版本号冲突检查 + 按快照原子重建草稿
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突）
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、恢复）
 ```
 
 ## 主要 HTTP API
@@ -136,3 +149,9 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
 - `POST /api/editor/publish` — 发布；体含 `selection:[{eventId,claimId}]`、`baseVersionNo`、`editor`、`note`
   - 422：`{errors:[{type:missing|cycle|temporal, eventIds, relationIds, message, detail}]}`
   - 409：`{code:"VERSION_CONFLICT", baseVersionNo, currentVersionNo, currentVersion}`
+- 从历史版本恢复草稿：
+  - `GET  /api/editor/restore/:versionNo` — 恢复预览（只读）：该版事件/被选主张/关系、当前将被替换的草稿、`draftRevision`、`currentVersionNo`；版本不存在 404
+  - `POST /api/editor/restore/:versionNo/confirm` — 体含 `draftRevision`、`baseVersionNo`；原子替换整个草稿，只恢复当版被选主张，返回 `{restoredFromVersionNo,currentVersionNo,draftRevision,mapping:{events,claims,relations},selection}`
+    - 409：`{code:"DRAFT_REVISION_CONFLICT", expectedRevision, currentRevision}` 或 `{code:"VERSION_CONFLICT", ...}`
+    - 404：目标版本不存在
+- `GET /api/editor/state` 返回体另含 `draftRevision`（草稿修订号，随每次增删改 / 恢复递增）

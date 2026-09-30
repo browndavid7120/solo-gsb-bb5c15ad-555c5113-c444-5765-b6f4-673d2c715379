@@ -38,6 +38,7 @@ beforeEach(() => {
     DELETE FROM claims;
     DELETE FROM events;
     DELETE FROM sqlite_sequence;
+    UPDATE draft_meta SET revision = 0 WHERE id = 1;
   `);
 });
 
@@ -254,4 +255,255 @@ test('自环关系在录入时即被拒绝', async () => {
   const e1 = await makeEvent('X');
   const r = await call('POST', '/api/editor/relations', { body: { earlierId: e1, laterId: e1 } });
   assert.strictEqual(r.status, 400);
+});
+
+// ============ 草稿修订号 ============
+
+test('草稿增删改都推进修订号；发布不推进', async () => {
+  const revision = async () => (await call('GET', '/api/editor/state')).json.draftRevision;
+  const s0 = await revision();
+
+  const e1 = await makeEvent('修订甲');
+  assert.strictEqual(await revision(), s0 + 1);
+  const e2 = await makeEvent('修订乙');
+  assert.strictEqual(await revision(), s0 + 2);
+  const c1 = await makeClaim(e1, { precision: 'year', year: 1958, source: 's' });
+  assert.strictEqual(await revision(), s0 + 3);
+  await makeRel(e1, e2);
+  assert.strictEqual(await revision(), s0 + 4);
+  await call('PUT', `/api/editor/events/${e1}`, { body: { title: '修订甲改' } });
+  assert.strictEqual(await revision(), s0 + 5);
+  await call('DELETE', `/api/editor/claims/${c1}`);
+  assert.strictEqual(await revision(), s0 + 6);
+
+  const c1b = await makeClaim(e1, { precision: 'year', year: 1958, source: 's' });
+  const c2 = await makeClaim(e2, { precision: 'year', year: 1959, source: 's' });
+  assert.strictEqual(await revision(), s0 + 8);
+
+  // 发布只写版本快照区，不推进草稿修订号
+  const pub = await call('POST', '/api/editor/publish', {
+    body: { selection: [{ eventId: e1, claimId: c1b }, { eventId: e2, claimId: c2 }], baseVersionNo: 0 },
+  });
+  assert.strictEqual(pub.status, 201);
+  assert.strictEqual(await revision(), s0 + 8);
+});
+
+// ============ 恢复草稿 ============
+
+async function publishTwoVersions() {
+  // v1：两个事件、各 2 条主张（含矛盾）、一条关系
+  const e1 = await makeEvent('动员会');
+  const e2 = await makeEvent('通水会');
+  const c1a = await makeClaim(e1, { precision: 'day', year: 1958, month: 9, day: 12, source: '李宝山口述' });
+  const c1b = await makeClaim(e1, { precision: 'year', year: 1958, source: '县水利志' }); // 矛盾主张，不选
+  const c2a = await makeClaim(e2, { precision: 'month', year: 1959, month: 5, source: '王秀兰口述' });
+  const c2b = await makeClaim(e2, { precision: 'year', year: 1960, source: '公社档案' });  // 矛盾主张，不选
+  const rel = await makeRel(e1, e2, '二人口述一致');
+  const p1 = await call('POST', '/api/editor/publish', {
+    body: { selection: [{ eventId: e1, claimId: c1a }, { eventId: e2, claimId: c2a }], baseVersionNo: 0, note: '首版' },
+  });
+  assert.strictEqual(p1.status, 201, JSON.stringify(p1.json));
+
+  // 草稿继续演化：改名、加第三个事件并发布 v2
+  await call('PUT', `/api/editor/events/${e1}`, { body: { title: '动员大会' } });
+  const e3 = await makeEvent('抽水机到站');
+  const c3 = await makeClaim(e3, { precision: 'year', year: 1962, source: '张德福口述' });
+  const p2 = await call('POST', '/api/editor/publish', {
+    body: {
+      selection: [{ eventId: e1, claimId: c1a }, { eventId: e2, claimId: c2a }, { eventId: e3, claimId: c3 }],
+      baseVersionNo: 1, note: '二版',
+    },
+  });
+  assert.strictEqual(p2.status, 201, JSON.stringify(p2.json));
+  return { e1, e2, e3, c1a, c1b, c2a, c2b, c3, rel };
+}
+
+test('恢复预览只读：列出该版内容与将被替换的草稿，不含未选主张', async () => {
+  const ids = await publishTwoVersions();
+
+  // 草稿再改点东西，确保预览看到“当前草稿”
+  await call('POST', '/api/editor/events', { body: { title: '草稿里才有的新事件' } });
+
+  const prev = await call('GET', '/api/editor/restore/1');
+  assert.strictEqual(prev.status, 200, JSON.stringify(prev.json));
+  assert.strictEqual(prev.json.versionNo, 1);
+  assert.strictEqual(prev.json.currentVersionNo, 2);
+  assert.strictEqual(prev.json.version.events.length, 2); // v1 只有两个事件
+  assert.strictEqual(prev.json.version.relations.length, 1);
+  // 该版被选主张
+  const v1e1 = prev.json.version.events.find((e) => e.title === '动员会');
+  assert.strictEqual(v1e1.claimId, ids.c1a);
+  assert.strictEqual(v1e1.resolvedDate, '1958-09-12');
+  // 当前草稿将被替换的内容（3 个已发布事件 + 1 个草稿新事件）
+  assert.strictEqual(prev.json.draft.events.length, 4);
+  assert.strictEqual(prev.json.draftRevision, (await call('GET', '/api/editor/state')).json.draftRevision);
+
+  // 预览后数据未变
+  const st = await call('GET', '/api/editor/state');
+  assert.strictEqual(st.json.events.length, 4);
+  assert.ok(st.json.events.some((e) => e.title === '草稿里才有的新事件'));
+
+  // 版本不存在
+  const miss = await call('GET', '/api/editor/restore/99');
+  assert.strictEqual(miss.status, 404);
+});
+
+test('确认恢复：原子替换草稿、只恢复被选主张、返回映射与待选主张；快照与访客年表不变', async () => {
+  const ids = await publishTwoVersions();
+
+  const prev = await call('GET', '/api/editor/restore/1');
+  assert.strictEqual(prev.status, 200);
+  const draftRevision = prev.json.draftRevision;
+  const currentVersionNo = prev.json.currentVersionNo;
+
+  const done = await call('POST', '/api/editor/restore/1/confirm', {
+    body: { draftRevision, baseVersionNo: currentVersionNo },
+  });
+  assert.strictEqual(done.status, 200, JSON.stringify(done.json));
+  assert.strictEqual(done.json.restoredFromVersionNo, 1);
+  assert.strictEqual(done.json.currentVersionNo, 2); // 最新版本号不变
+  assert.strictEqual(done.json.draftRevision, draftRevision + 1);
+
+  // 旧快照 id → 新草稿 id 映射
+  const newE1 = Number(done.json.mapping.events[String(ids.e1)]);
+  const newE2 = Number(done.json.mapping.events[String(ids.e2)]);
+  const newC1a = Number(done.json.mapping.claims[String(ids.c1a)]);
+  const newC2a = Number(done.json.mapping.claims[String(ids.c2a)]);
+  const newRel = Number(done.json.mapping.relations[String(ids.rel)]);
+  assert.ok(newE1 > 0 && newE2 > 0 && newC1a > 0 && newC2a > 0 && newRel > 0);
+  // 未发布进快照的矛盾主张不在映射里
+  assert.strictEqual(done.json.mapping.claims[String(ids.c1b)], undefined);
+  assert.strictEqual(done.json.mapping.claims[String(ids.c2b)], undefined);
+  // v1 没有的事件不在映射里
+  assert.strictEqual(done.json.mapping.events[String(ids.e3)], undefined);
+
+  // 待选主张：每事件一条，恰好是该版被选主张的新 id
+  assert.deepStrictEqual(
+    done.json.selection.map((s) => `${s.eventId}:${s.claimId}`).sort(),
+    [`${newE1}:${newC1a}`, `${newE2}:${newC2a}`].sort()
+  );
+
+  // 草稿被整体重建：2 个事件、每个仅 1 条（被选）主张、1 条关系、标题为 v1 时的标题
+  const st = await call('GET', '/api/editor/state');
+  assert.strictEqual(st.json.events.length, 2);
+  assert.strictEqual(st.json.draftRevision, draftRevision + 1);
+  const gotE1 = st.json.events.find((e) => e.id === newE1);
+  assert.strictEqual(gotE1.title, '动员会'); // 恢复的是 v1 标题，而非草稿后来改的“动员大会”
+  assert.strictEqual(gotE1.claims.length, 1);
+  assert.strictEqual(gotE1.claims[0].id, newC1a);
+  assert.strictEqual(gotE1.claims[0].dateLabel, '1958 年 09 月 12 日');
+  assert.strictEqual(gotE1.claims[0].precision, 'day');
+  assert.strictEqual(gotE1.claims[0].year, 1958);
+  assert.strictEqual(gotE1.claims[0].month, 9);
+  assert.strictEqual(gotE1.claims[0].day, 12);
+  assert.strictEqual(st.json.relations.length, 1);
+  assert.deepStrictEqual(
+    { earlierId: st.json.relations[0].earlierId, laterId: st.json.relations[0].laterId, source: st.json.relations[0].source },
+    { earlierId: newE1, laterId: newE2, source: '二人口述一致' }
+  );
+
+  // 恢复出的草稿可通过校验
+  const val = await call('POST', '/api/editor/validate', { body: { selection: done.json.selection } });
+  assert.strictEqual(val.status, 200);
+  assert.strictEqual(val.json.ok, true, JSON.stringify(val.json));
+
+  // 历史快照与访客年表保持不变（仍为 v2）
+  const view = await call('GET', '/api/public/chronicle', { token: null });
+  assert.strictEqual(view.json.currentVersionNo, 2);
+  assert.strictEqual(view.json.version.events.length, 3);
+  const v1 = await call('GET', '/api/public/versions/1', { token: null });
+  assert.strictEqual(v1.status, 200);
+  assert.strictEqual(v1.json.version.events.length, 2);
+});
+
+test('恢复后再发布仍遵守口令/校验/baseVersionNo 约定', async () => {
+  const ids = await publishTwoVersions();
+  const prev = await call('GET', '/api/editor/restore/1');
+  const done = await call('POST', '/api/editor/restore/1/confirm', {
+    body: { draftRevision: prev.json.draftRevision, baseVersionNo: prev.json.currentVersionNo },
+  });
+  assert.strictEqual(done.status, 200, JSON.stringify(done.json));
+
+  // 恢复接口需要口令
+  const noToken = await call('POST', '/api/editor/restore/1/confirm', {
+    token: null, body: { draftRevision: prev.json.draftRevision, baseVersionNo: 2 },
+  });
+  assert.strictEqual(noToken.status, 401);
+
+  // 用旧 baseVersionNo=0 发布应冲突
+  const badBase = await call('POST', '/api/editor/publish', {
+    body: { selection: done.json.selection, baseVersionNo: 0 },
+  });
+  assert.strictEqual(badBase.status, 409);
+
+  // 基于 2 正常发布 → 第 3 版，内容为恢复出的 v1 内容
+  const p3 = await call('POST', '/api/editor/publish', {
+    body: { selection: done.json.selection, baseVersionNo: 2, note: '恢复第1版后再发布' },
+  });
+  assert.strictEqual(p3.status, 201, JSON.stringify(p3.json));
+  assert.strictEqual(p3.json.versionNo, 3);
+  assert.strictEqual(p3.json.version.parentNo, 2);
+  assert.deepStrictEqual(p3.json.version.events.map((e) => e.title).sort(), ['动员会', '通水会']);
+  assert.strictEqual(p3.json.version.relations.length, 1);
+});
+
+test('确认时草稿已变化 → 409 草稿修订号冲突且不改数据', async () => {
+  await publishTwoVersions();
+  const prev = await call('GET', '/api/editor/restore/1');
+
+  // 另一编辑改动草稿
+  await call('POST', '/api/editor/events', { body: { title: '后来插入的事件' } });
+
+  const bad = await call('POST', '/api/editor/restore/1/confirm', {
+    body: { draftRevision: prev.json.draftRevision, baseVersionNo: prev.json.currentVersionNo },
+  });
+  assert.strictEqual(bad.status, 409);
+  assert.strictEqual(bad.json.code, 'DRAFT_REVISION_CONFLICT');
+  assert.strictEqual(bad.json.expectedRevision, prev.json.draftRevision);
+  assert.strictEqual(bad.json.currentRevision, prev.json.draftRevision + 1);
+
+  // 数据未被替换：新事件仍在，且仍是 v2 的三事件结构（e1 在发 v2 前已改名）
+  const st = await call('GET', '/api/editor/state');
+  assert.ok(st.json.events.some((e) => e.title === '后来插入的事件'));
+  assert.ok(st.json.events.some((e) => e.title === '动员大会'));
+  assert.ok(st.json.events.some((e) => e.title === '抽水机到站'));
+  assert.strictEqual(st.json.events.length, 4);
+});
+
+test('确认时最新版本已变化 → 409 版本冲突且不改数据', async () => {
+  const ids = await publishTwoVersions(); // 最新 = 2
+  const prev = await call('GET', '/api/editor/restore/1');
+
+  // 模拟他人发布第 3 版：在恢复前不改草稿，直接用现有草稿发布
+  const st = await call('GET', '/api/editor/state');
+  const sel = [];
+  for (const ev of st.json.events) {
+    // 每个事件选其第一条主张（草稿中各事件都有主张）
+    sel.push({ eventId: ev.id, claimId: ev.claims[0].id });
+  }
+  const p3 = await call('POST', '/api/editor/publish', {
+    body: { selection: sel, baseVersionNo: 2 },
+  });
+  assert.strictEqual(p3.status, 201, JSON.stringify(p3.json));
+
+  const bad = await call('POST', '/api/editor/restore/1/confirm', {
+    body: { draftRevision: prev.json.draftRevision, baseVersionNo: 2 },
+  });
+  assert.strictEqual(bad.status, 409);
+  assert.strictEqual(bad.json.code, 'VERSION_CONFLICT');
+  assert.strictEqual(bad.json.currentVersionNo, 3);
+
+  // 访客年表未被恢复影响
+  const view = await call('GET', '/api/public/chronicle', { token: null });
+  assert.strictEqual(view.json.currentVersionNo, 3);
+});
+
+test('确认不存在的版本 → 404；参数非法 → 400', async () => {
+  const miss = await call('POST', '/api/editor/restore/99/confirm', {
+    body: { draftRevision: 0, baseVersionNo: 0 },
+  });
+  assert.strictEqual(miss.status, 404);
+
+  const badRev = await call('POST', '/api/editor/restore/1/confirm', { body: { baseVersionNo: 0 } });
+  assert.strictEqual(badRev.status, 400);
 });
